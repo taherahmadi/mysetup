@@ -2,34 +2,60 @@
 # Claude Code Status Line
 input=$(cat)
 
-# ── Extract all fields ──
-MODEL=$(echo "$input" | jq -r '.model.display_name // "?"')
-MODEL_ID=$(echo "$input" | jq -r '.model.id // ""')
-DIR=$(echo "$input" | jq -r '.workspace.current_dir // ""')
-PROJECT_DIR=$(echo "$input" | jq -r '.workspace.project_dir // ""')
-# Extract original launch dir from transcript_path
-# Path format: ~/.claude/projects/-home-taher-Projects-emr-annotation/session.jsonl
-TRANSCRIPT_PATH=$(echo "$input" | jq -r '.transcript_path // ""')
-PROJECT_SLUG=$(echo "$TRANSCRIPT_PATH" | sed 's|.*/projects/||; s|/.*||')
-LAUNCH_DIR=$(echo "$PROJECT_SLUG" | sed 's|^-home-taher-|~/|; s|^-home-taher$|~|')
-COST=$(echo "$input" | jq -r '.cost.total_cost_usd // 0')
-PCT=$(echo "$input" | jq -r '.context_window.used_percentage // 0' | cut -d. -f1)
-CTX_SIZE=$(echo "$input" | jq -r '.context_window.context_window_size // 0')
-DURATION_MS=$(echo "$input" | jq -r '.cost.total_duration_ms // 0')
-LINES_ADDED=$(echo "$input" | jq -r '.cost.total_lines_added // 0')
-LINES_REMOVED=$(echo "$input" | jq -r '.cost.total_lines_removed // 0')
-SESSION_NAME=$(echo "$input" | jq -r '.session_name // empty')
-WORKTREE_NAME=$(echo "$input" | jq -r '.worktree.name // empty')
-GIT_WORKTREE=$(echo "$input" | jq -r '.workspace.git_worktree // empty')
-AGENT_NAME=$(echo "$input" | jq -r '.agent.name // empty')
-VIM_MODE=$(echo "$input" | jq -r '.vim.mode // empty')
-TOTAL_IN=$(echo "$input" | jq -r '.context_window.total_input_tokens // 0')
-TOTAL_OUT=$(echo "$input" | jq -r '.context_window.total_output_tokens // 0')
-SESSION_ID=$(echo "$input" | jq -r '.session_id // ""')
-EXCEEDS_200K=$(echo "$input" | jq -r '.exceeds_200k_tokens // false')
+# ── Path display ──
+# tildify PATH [SEP] — replace a leading $HOME with "~".
+# SEP is the separator PATH uses: "/" for real filesystem paths, "-" for
+# Claude Code transcript slugs (which encode "/" as "-"). $HOME is read at
+# runtime, so this works for whoever cloned the repo. Output always uses "/".
+tildify() {
+    local path="$1" sep="${2:-/}" home="${HOME:-}"
+    if [ -z "$home" ]; then echo "$path"; return; fi
+    [ "$sep" = "/" ] || home="${home//\//$sep}"
+    if [ "$path" = "$home" ]; then
+        echo "~"
+    elif [ "${path#"$home$sep"}" != "$path" ]; then
+        echo "~/${path#"$home$sep"}"
+    else
+        echo "$path"
+    fi
+}
 
-# Rate limits (Claude.ai subscribers) — all keys under .rate_limits, "label|pct" per line
-RATE_LIMITS=$(echo "$input" | jq -r '.rate_limits // {} | to_entries[] | select(.value.used_percentage != null) | "\(.key)|\(.value.used_percentage)"')
+# ── Extract all fields ──
+# One jq pass instead of one per field. @sh quotes every value, so eval is
+# safe even for directories with spaces or quotes in them.
+eval "$(echo "$input" | jq -r '
+    def q: @sh;
+    "MODEL=\(.model.display_name // "?" | q)",
+    "DIR=\(.workspace.current_dir // "" | q)",
+    "TRANSCRIPT_PATH=\(.transcript_path // "" | q)",
+    "COST=\(.cost.total_cost_usd // 0 | q)",
+    "PCT=\(.context_window.used_percentage // 0 | floor | q)",
+    "DURATION_MS=\(.cost.total_duration_ms // 0 | q)",
+    "LINES_ADDED=\(.cost.total_lines_added // 0 | q)",
+    "LINES_REMOVED=\(.cost.total_lines_removed // 0 | q)",
+    "SESSION_NAME=\(.session_name // "" | q)",
+    "WORKTREE_NAME=\(.worktree.name // "" | q)",
+    "GIT_WORKTREE=\(.workspace.git_worktree // "" | q)",
+    "AGENT_NAME=\(.agent.name // "" | q)",
+    "VIM_MODE=\(.vim.mode // "" | q)",
+    "TOTAL_IN=\(.context_window.total_input_tokens // 0 | q)",
+    "TOTAL_OUT=\(.context_window.total_output_tokens // 0 | q)",
+    "SESSION_ID=\(.session_id // "" | q)",
+    "EXCEEDS_200K=\(.exceeds_200k_tokens // false | q)",
+    # Rate limits (Claude.ai subscribers): "label|pct" per line
+    "RATE_LIMITS=\([.rate_limits // {} | to_entries[]
+        | select(.value.used_percentage != null)
+        | "\(.key)|\(.value.used_percentage)"] | join("\n") | q)"
+' 2>/dev/null)"
+
+# Fallbacks so the bar still renders if the input JSON was unparseable.
+: "${MODEL:=?}" "${PCT:=0}" "${COST:=0}" "${DURATION_MS:=0}" "${LINES_ADDED:=0}" \
+  "${LINES_REMOVED:=0}" "${TOTAL_IN:=0}" "${TOTAL_OUT:=0}" "${EXCEEDS_200K:=false}"
+
+# Original launch dir, recovered from the transcript path.
+# Format: ~/.claude/projects/-home-<user>-Projects-emr-annotation/session.jsonl
+PROJECT_SLUG=$(echo "$TRANSCRIPT_PATH" | sed 's|.*/projects/||; s|/.*||')
+LAUNCH_DIR=$(tildify "$PROJECT_SLUG" "-")
 
 # ── Colors ──
 BOLD='\033[1m'
@@ -125,15 +151,6 @@ inline_bar() {
     echo -n "${GRAY}[${RESET}${bg}\033[30m${text:0:filled}${RESET}\033[100m\033[30m${text:filled}${RESET}${GRAY}]${RESET}"
 }
 
-# ── Format context size ──
-if [ "$CTX_SIZE" -ge 1000000 ]; then
-    CTX_LABEL="1M"
-elif [ "$CTX_SIZE" -ge 200000 ]; then
-    CTX_LABEL="200K"
-else
-    CTX_LABEL="${CTX_SIZE}"
-fi
-
 # ── Format tokens ──
 format_tokens() {
     local tokens=$1
@@ -199,7 +216,7 @@ IFS='|' read -r GIT_REPO BRANCH STAGED MODIFIED UNTRACKED AHEAD BEHIND STASHES <
 # The statusline stdin JSON only carries five_hour/seven_day; the per-model
 # weekly bar shown by /usage comes from api.anthropic.com/api/oauth/usage.
 # Token is read locally and sent only to api.anthropic.com.
-USAGE_CACHE="/tmp/claude-statusline-usage-${USER}.json"
+USAGE_CACHE="/tmp/claude-statusline-usage-${USER:-$(id -un)}.json"
 USAGE_TTL=60
 
 usage_cache_stale() {
@@ -266,8 +283,8 @@ fi
 # ── LINE 2: CWD  git-repo  branch  ahead/behind  staged/modified/untracked ──
 LINE2=""
 
-# Full current working directory (replace /home/taher with ~)
-DIR_DISPLAY=$(echo "$DIR" | sed 's|^/home/taher|~|')
+# Full current working directory ($HOME shortened to ~)
+DIR_DISPLAY=$(tildify "$DIR")
 LINE2="${THEME_DIR}${ICON_DIR} ${DIR_DISPLAY}${RESET}"
 
 # Worktree annotation (if applicable)
